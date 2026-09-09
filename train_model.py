@@ -34,10 +34,20 @@ with open(DATA_FILE, "r", newline="") as f:
     header = next(reader)
     for row in reader:
         label = row[0]
-        coords = [float(v) for v in row[1:]]
-        features.append(normalize_landmarks(coords))
-        labels.append(label)
+        coords = [float(v) for v in row[1:64]]  # the 63 raw landmark values
 
+        # Older rows might not have motion columns yet -- default to zeros
+        if len(row) >= 70:
+            motion = [float(v) for v in row[64:70]]
+        else:
+            motion = [0, 0, 0, 0, 0, 0]
+
+        shape_features = normalize_landmarks(coords)
+        combined_features = np.concatenate([shape_features, motion])
+
+        features.append(combined_features)
+        labels.append(label)
+        
 X = np.array(features)
 y = np.array(labels)
 

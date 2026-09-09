@@ -3,6 +3,8 @@ import mediapipe as mp
 import numpy as np
 import pickle
 import time
+import math
+from collections import deque, Counter
 
 MODEL_PATH = "hand_landmarker.task"
 SIGN_MODEL_PATH = "sign_model.pkl"
@@ -41,26 +43,61 @@ def normalize_landmarks(hand_landmarks):
     return points.flatten()
 
 
-# --- Word-building settings you can tune ---
-STABILITY_FRAMES = 15   # how many consecutive matching frames = "held steady"
-CONFIDENCE_MIN = 0.6    # ignore predictions the model itself isn't confident about
+def compute_motion_features(fingertip_path):
+    if len(fingertip_path) < 2:
+        return [0, 0, 0, 0, 0, 0]
+
+    path_length = 0.0
+    direction_changes = 0
+    prev_dx, prev_dy = None, None
+
+    xs = [p[0] for p in fingertip_path]
+    ys = [p[1] for p in fingertip_path]
+
+    for i in range(1, len(fingertip_path)):
+        x1, y1 = fingertip_path[i - 1]
+        x2, y2 = fingertip_path[i]
+        dx, dy = x2 - x1, y2 - y1
+        path_length += math.hypot(dx, dy)
+
+        if prev_dx is not None:
+            if (dx * prev_dx < 0) or (dy * prev_dy < 0):
+                direction_changes += 1
+        prev_dx, prev_dy = dx, dy
+
+    start = fingertip_path[0]
+    end = fingertip_path[-1]
+    net_displacement = math.hypot(end[0] - start[0], end[1] - start[1])
+    straightness = net_displacement / path_length if path_length > 0 else 0
+    bbox_width = max(xs) - min(xs)
+    bbox_height = max(ys) - min(ys)
+
+    return [path_length, net_displacement, straightness, bbox_width, bbox_height, direction_changes]
+
+
+STABILITY_FRAMES = 15
+CONFIDENCE_MIN = 0.6
+MOTION_WINDOW = 20      # how many recent frames of fingertip position we track
+SMOOTHING_WINDOW = 4    # how many frames we average together to reduce jitter
 
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 if not cap.isOpened():
     print("Could not open webcam.")
     exit()
 
-print("Live spelling started.")
-print("Hold a letter steady to type it. SPACE = space, BACKSPACE = delete, C = clear, ESC = quit.")
+print("Live spelling started (now with J and Z!).")
+print("Hold a letter steady, or perform J/Z's motion, to type it.")
+print("SPACE = space, BACKSPACE = delete, C = clear, ESC = quit.")
 
 start_time = time.time()
 typed_text = ""
 
 streak_letter = None
 streak_count = 0
-locked = False  # True once the current streak has already been typed
+locked = False
+
+landmark_smoothing = deque(maxlen=SMOOTHING_WINDOW)
+fingertip_history = deque(maxlen=MOTION_WINDOW)
 
 with HandLandmarker.create_from_options(options) as landmarker:
     while True:
@@ -86,7 +123,16 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 for x, y in points:
                     cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
 
-                features = normalize_landmarks(hand).reshape(1, -1)
+                raw_normalized = normalize_landmarks(hand)
+                landmark_smoothing.append(raw_normalized)
+                smoothed = np.mean(landmark_smoothing, axis=0)
+
+                fingertip_xy = (smoothed[8 * 3], smoothed[8 * 3 + 1])
+                fingertip_history.append(fingertip_xy)
+
+                motion_features = compute_motion_features(list(fingertip_history))
+
+                features = np.concatenate([smoothed, motion_features]).reshape(1, -1)
                 probabilities = model.predict_proba(features)[0]
                 best_index = np.argmax(probabilities)
                 confidence = probabilities[best_index]
@@ -94,8 +140,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
                 if confidence >= CONFIDENCE_MIN:
                     current_letter = predicted
+        else:
+            # Hand left the frame -- clear the motion history so old
+            # movement doesn't bleed into the next gesture
+            landmark_smoothing.clear()
+            fingertip_history.clear()
 
-        # --- Track how long the same letter has been held ---
         if current_letter is not None and current_letter == streak_letter:
             streak_count += 1
         elif current_letter is not None:
@@ -107,12 +157,10 @@ with HandLandmarker.create_from_options(options) as landmarker:
             streak_count = 0
             locked = False
 
-        # Commit the letter once it's been held steady long enough
         if streak_count >= STABILITY_FRAMES and not locked:
             typed_text += streak_letter
-            locked = True  # won't type again until you change shape or drop your hand
+            locked = True
 
-        # --- Draw the UI ---
         if current_letter:
             cv2.putText(frame, current_letter.upper(), (30, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 2.2, (0, 255, 0), 5)
@@ -133,11 +181,11 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
         key = cv2.waitKey(1) & 0xFF
 
-        if key == 27:  # ESC
+        if key == 27:
             break
-        elif key == 32:  # SPACE
+        elif key == 32:
             typed_text += " "
-        elif key == 8:  # BACKSPACE
+        elif key == 8:
             typed_text = typed_text[:-1]
         elif key in (ord('c'), ord('C')):
             typed_text = ""

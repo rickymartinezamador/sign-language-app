@@ -13,14 +13,8 @@
     align-items: center;
     padding: 20px;
   }
-  #video {
-    display: none; /* only used as a hidden source, we draw the visible frame ourselves */
-  }
-  #canvas {
-    width: 640px;
-    height: 480px;
-    border-radius: 6px;
-  }
+  #video { display: none; }
+  #canvas { width: 640px; height: 480px; border-radius: 6px; }
   #typedBar {
     margin-top: 15px;
     width: 640px;
@@ -31,14 +25,8 @@
     font-size: 22px;
     letter-spacing: 1px;
   }
-  #status {
-    margin-top: 10px;
-    color: #aaa;
-    font-size: 14px;
-  }
-  #controls {
-    margin-top: 10px;
-  }
+  #status { margin-top: 10px; color: #aaa; font-size: 14px; }
+  #controls { margin-top: 10px; }
   button {
     background: #333;
     color: #eee;
@@ -48,9 +36,7 @@
     border-radius: 4px;
     cursor: pointer;
   }
-  button:hover {
-    background: #444;
-  }
+  button:hover { background: #444; }
 </style>
 </head>
 <body>
@@ -93,11 +79,16 @@ const HAND_CONNECTIONS = [
 
 const STABILITY_FRAMES = 15;
 const CONFIDENCE_MIN = 0.6;
+const MOTION_WINDOW = 20;
+const SMOOTHING_WINDOW = 4;
 
 let typedText = "";
 let streakLetter = null;
 let streakCount = 0;
 let locked = false;
+
+let landmarkSmoothing = [];
+let fingertipHistory = [];
 
 let model = null;
 let handLandmarker = null;
@@ -107,34 +98,66 @@ async function loadModel() {
   model = await response.json();
 }
 
-// Same normalization as normalize_landmarks() in Python
 function normalizeLandmarks(landmarks) {
   const points = landmarks.map(p => [p.x, p.y, p.z]);
   const wrist = points[0];
   const shifted = points.map(p => [p[0] - wrist[0], p[1] - wrist[1], p[2] - wrist[2]]);
-
   const ref = shifted[9];
   const scale = Math.sqrt(ref[0] ** 2 + ref[1] ** 2 + ref[2] ** 2);
-
   const normalized = shifted.map(p =>
     scale > 0 ? [p[0] / scale, p[1] / scale, p[2] / scale] : p
   );
-
   return normalized.flat();
+}
+
+function averageArrays(arrays) {
+  const len = arrays[0].length;
+  const avg = new Array(len).fill(0);
+  for (const arr of arrays) {
+    for (let i = 0; i < len; i++) avg[i] += arr[i];
+  }
+  for (let i = 0; i < len; i++) avg[i] /= arrays.length;
+  return avg;
+}
+
+function computeMotionFeatures(fingertipPath) {
+  if (fingertipPath.length < 2) return [0, 0, 0, 0, 0, 0];
+
+  let pathLength = 0;
+  let directionChanges = 0;
+  let prevDx = null, prevDy = null;
+
+  const xs = fingertipPath.map(p => p[0]);
+  const ys = fingertipPath.map(p => p[1]);
+
+  for (let i = 1; i < fingertipPath.length; i++) {
+    const [x1, y1] = fingertipPath[i - 1];
+    const [x2, y2] = fingertipPath[i];
+    const dx = x2 - x1, dy = y2 - y1;
+    pathLength += Math.hypot(dx, dy);
+
+    if (prevDx !== null) {
+      if ((dx * prevDx < 0) || (dy * prevDy < 0)) directionChanges++;
+    }
+    prevDx = dx; prevDy = dy;
+  }
+
+  const start = fingertipPath[0];
+  const end = fingertipPath[fingertipPath.length - 1];
+  const netDisplacement = Math.hypot(end[0] - start[0], end[1] - start[1]);
+  const straightness = pathLength > 0 ? netDisplacement / pathLength : 0;
+  const bboxWidth = Math.max(...xs) - Math.min(...xs);
+  const bboxHeight = Math.max(...ys) - Math.min(...ys);
+
+  return [pathLength, netDisplacement, straightness, bboxWidth, bboxHeight, directionChanges];
 }
 
 function walkTree(tree, features) {
   let nodeIndex = 0;
   while (true) {
     const node = tree[nodeIndex];
-    if (node.feature === -2) {
-      return node.probs;
-    }
-    if (features[node.feature] <= node.threshold) {
-      nodeIndex = node.left;
-    } else {
-      nodeIndex = node.right;
-    }
+    if (node.feature === -2) return node.probs;
+    nodeIndex = features[node.feature] <= node.threshold ? node.left : node.right;
   }
 }
 
@@ -144,9 +167,7 @@ function predict(features) {
 
   for (const tree of model.trees) {
     const probs = walkTree(tree, features);
-    for (let i = 0; i < numClasses; i++) {
-      totals[i] += probs[i];
-    }
+    for (let i = 0; i < numClasses; i++) totals[i] += probs[i];
   }
 
   const numTrees = model.trees.length;
@@ -184,10 +205,6 @@ function updateTypedBar() {
 }
 
 function predictWebcam() {
-  // Draw the CURRENT video frame onto the canvas, flipped horizontally.
-  // This is the JS equivalent of Python's cv2.flip(frame, 1) -- it makes
-  // the actual pixel data mirrored, not just the on-screen look, so the
-  // hand detector sees the same orientation the model was trained on.
   ctx.save();
   ctx.scale(-1, 1);
   ctx.drawImage(video, -WIDTH, 0, WIDTH, HEIGHT);
@@ -202,16 +219,29 @@ function predictWebcam() {
     const landmarks = result.landmarks[0];
     drawHand(landmarks);
 
-    const features = normalizeLandmarks(landmarks);
+    const rawNormalized = normalizeLandmarks(landmarks);
+    landmarkSmoothing.push(rawNormalized);
+    if (landmarkSmoothing.length > SMOOTHING_WINDOW) landmarkSmoothing.shift();
+    const smoothed = averageArrays(landmarkSmoothing);
+
+    const fingertip = [smoothed[8 * 3], smoothed[8 * 3 + 1]];
+    fingertipHistory.push(fingertip);
+    if (fingertipHistory.length > MOTION_WINDOW) fingertipHistory.shift();
+
+    const motionFeatures = computeMotionFeatures(fingertipHistory);
+    const features = smoothed.concat(motionFeatures);
+
     const { letter, confidence } = predict(features);
 
     if (confidence >= CONFIDENCE_MIN) {
       currentLetter = letter;
-
       ctx.font = "bold 60px Arial";
       ctx.fillStyle = "lime";
       ctx.fillText(letter.toUpperCase(), 20, 80);
     }
+  } else {
+    landmarkSmoothing = [];
+    fingertipHistory = [];
   }
 
   if (currentLetter !== null && currentLetter === streakLetter) {
@@ -271,7 +301,7 @@ async function init() {
   video.srcObject = stream;
 
   video.addEventListener("loadeddata", () => {
-    statusEl.textContent = "Ready! Hold up a letter shape.";
+    statusEl.textContent = "Ready! Hold up a letter shape, or sign J/Z.";
     predictWebcam();
   });
 }
