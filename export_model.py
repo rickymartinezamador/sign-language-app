@@ -2,6 +2,7 @@ import pickle
 import json
 import numpy as np
 
+
 SIGN_MODEL_PATH = "sign_model.pkl"
 OUTPUT_PATH = "model.json"
 
