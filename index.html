@@ -26,17 +26,65 @@
     letter-spacing: 1px;
   }
   #status { margin-top: 10px; color: #aaa; font-size: 14px; }
-  #controls { margin-top: 10px; }
+  #controls { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
   button {
     background: #333;
     color: #eee;
     border: 1px solid #555;
     padding: 8px 14px;
-    margin-right: 8px;
     border-radius: 4px;
     cursor: pointer;
+    font-size: 14px;
   }
-  button:hover { background: #444; }
+  button:hover { filter: brightness(1.15); }
+
+  #quizModeBtn { background: #5865f2; border-color: #4752c4; color: #fff; font-weight: bold; }
+  #exitQuizBtn { background: #444; }
+
+  #quizPanel {
+    margin-top: 15px;
+    width: 640px;
+    background: #1b1b1b;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 16px;
+    display: none;
+    text-align: center;
+  }
+
+  .difficulty-row { display: flex; gap: 12px; justify-content: center; margin-top: 8px; }
+  .easy-btn { background: #2ecc71; border-color: #27ae60; color: #063; font-weight: bold; padding: 10px 20px; font-size: 15px; }
+  .medium-btn { background: #f39c12; border-color: #d9820b; color: #4a2900; font-weight: bold; padding: 10px 20px; font-size: 15px; }
+
+  #quizTargetLetter { font-size: 72px; font-weight: bold; color: #5865f2; margin: 10px 0; }
+  #quizTimerBarOuter { width: 100%; height: 14px; background: #333; border-radius: 7px; overflow: hidden; margin: 10px 0; }
+  #quizTimerBarInner { height: 100%; background: #5865f2; width: 100%; transition: width 0.1s linear; }
+  #quizProgressText { color: #aaa; font-size: 14px; }
+  #quizLiveScore { font-size: 18px; font-weight: bold; margin-top: 8px; }
+
+  #scoreboard {
+    margin-top: 15px;
+    width: 640px;
+    background: #1b1b1b;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 14px;
+    display: none;
+  }
+  #scoreboard h3 { margin: 0 0 8px 0; font-size: 16px; color: #ccc; }
+  #scoreboardSummary { font-size: 15px; margin-bottom: 10px; }
+  #scoreboardChips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    font-weight: bold;
+    font-size: 14px;
+  }
+  .chip.correct { background: #2ecc71; color: #063; }
+  .chip.wrong { background: #e74c3c; color: #3a0a05; }
 </style>
 </head>
 <body>
@@ -55,6 +103,31 @@
   <a href="https://deafchildren.org/2019/06/free-asl-alphabet-chart/" target="_blank" rel="noopener noreferrer">
     <button type="button">ASL Alphabet Chart</button>
   </a>
+  <button id="quizModeBtn">Quiz Mode</button>
+</div>
+
+<div id="quizPanel">
+  <div id="quizSetup">
+    <p>Choose a difficulty:</p>
+    <div class="difficulty-row">
+      <button class="easy-btn" id="easyBtn">Easy (8s per letter)</button>
+      <button class="medium-btn" id="mediumBtn">Medium (4s per letter)</button>
+    </div>
+  </div>
+
+  <div id="quizPlay" style="display:none;">
+    <div id="quizProgressText">Letter 1 of 10</div>
+    <div id="quizTargetLetter">A</div>
+    <div id="quizTimerBarOuter"><div id="quizTimerBarInner"></div></div>
+    <div id="quizLiveScore">Score: 0 / 0</div>
+    <button id="exitQuizBtn">Exit Quiz</button>
+  </div>
+</div>
+
+<div id="scoreboard">
+  <h3>Last Quiz Attempt</h3>
+  <div id="scoreboardSummary"></div>
+  <div id="scoreboardChips"></div>
 </div>
 
 <div id="status">Loading model and camera...</div>
@@ -85,6 +158,10 @@ const CONFIDENCE_MIN = 0.6;
 const MOTION_WINDOW = 20;
 const SMOOTHING_WINDOW = 4;
 
+const ALPHABET = "abcdefghijklmnopqrstuvwxyz".split("");
+const QUIZ_LENGTH = 10;
+const QUIZ_TIME = { easy: 8, medium: 4 }; // seconds per letter
+
 let typedText = "";
 let streakLetter = null;
 let streakCount = 0;
@@ -95,6 +172,26 @@ let fingertipHistory = [];
 
 let model = null;
 let handLandmarker = null;
+
+// ---- Quiz state ----
+let quizMode = false;          // true while actively playing a round
+let quizDifficulty = null;
+let quizLetters = [];
+let quizIndex = 0;
+let quizScore = 0;
+let quizResults = [];
+let quizLetterStartMs = 0;
+
+const quizPanel = document.getElementById("quizPanel");
+const quizSetup = document.getElementById("quizSetup");
+const quizPlay = document.getElementById("quizPlay");
+const quizTargetLetterEl = document.getElementById("quizTargetLetter");
+const quizProgressTextEl = document.getElementById("quizProgressText");
+const quizTimerBarInner = document.getElementById("quizTimerBarInner");
+const quizLiveScoreEl = document.getElementById("quizLiveScore");
+const scoreboard = document.getElementById("scoreboard");
+const scoreboardSummary = document.getElementById("scoreboardSummary");
+const scoreboardChips = document.getElementById("scoreboardChips");
 
 async function loadModel() {
   const response = await fetch("model.json");
@@ -125,33 +222,27 @@ function averageArrays(arrays) {
 
 function computeMotionFeatures(fingertipPath) {
   if (fingertipPath.length < 2) return [0, 0, 0, 0, 0, 0];
-
   let pathLength = 0;
   let directionChanges = 0;
   let prevDx = null, prevDy = null;
-
   const xs = fingertipPath.map(p => p[0]);
   const ys = fingertipPath.map(p => p[1]);
-
   for (let i = 1; i < fingertipPath.length; i++) {
     const [x1, y1] = fingertipPath[i - 1];
     const [x2, y2] = fingertipPath[i];
     const dx = x2 - x1, dy = y2 - y1;
     pathLength += Math.hypot(dx, dy);
-
     if (prevDx !== null) {
       if ((dx * prevDx < 0) || (dy * prevDy < 0)) directionChanges++;
     }
     prevDx = dx; prevDy = dy;
   }
-
   const start = fingertipPath[0];
   const end = fingertipPath[fingertipPath.length - 1];
   const netDisplacement = Math.hypot(end[0] - start[0], end[1] - start[1]);
   const straightness = pathLength > 0 ? netDisplacement / pathLength : 0;
   const bboxWidth = Math.max(...xs) - Math.min(...xs);
   const bboxHeight = Math.max(...ys) - Math.min(...ys);
-
   return [pathLength, netDisplacement, straightness, bboxWidth, bboxHeight, directionChanges];
 }
 
@@ -167,20 +258,16 @@ function walkTree(tree, features) {
 function predict(features) {
   const numClasses = model.classes.length;
   const totals = new Array(numClasses).fill(0);
-
   for (const tree of model.trees) {
     const probs = walkTree(tree, features);
     for (let i = 0; i < numClasses; i++) totals[i] += probs[i];
   }
-
   const numTrees = model.trees.length;
   const avgProbs = totals.map(v => v / numTrees);
-
   let bestIndex = 0;
   for (let i = 1; i < avgProbs.length; i++) {
     if (avgProbs[i] > avgProbs[bestIndex]) bestIndex = i;
   }
-
   return { letter: model.classes[bestIndex], confidence: avgProbs[bestIndex] };
 }
 
@@ -206,6 +293,108 @@ function drawHand(landmarks) {
 function updateTypedBar() {
   typedBar.textContent = typedText || "…";
 }
+
+// ---- Quiz helpers ----
+function pickQuizLetters(count) {
+  // Shuffle a copy of the alphabet, then take the first `count` letters --
+  // guarantees no repeats within a single quiz round.
+  const shuffled = [...ALPHABET];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, count);
+}
+
+function startQuiz(difficulty) {
+  quizDifficulty = difficulty;
+  quizLetters = pickQuizLetters(QUIZ_LENGTH);
+  quizIndex = 0;
+  quizScore = 0;
+  quizResults = [];
+  quizMode = true;
+  quizLetterStartMs = performance.now();
+
+  quizSetup.style.display = "none";
+  quizPlay.style.display = "block";
+  scoreboard.style.display = "none";
+
+  renderQuizPlayUI();
+}
+
+function advanceQuizLetter(wasCorrect) {
+  quizResults.push({ letter: quizLetters[quizIndex], correct: wasCorrect });
+  if (wasCorrect) quizScore++;
+  quizIndex++;
+
+  if (quizIndex >= quizLetters.length) {
+    finishQuiz();
+  } else {
+    quizLetterStartMs = performance.now();
+    renderQuizPlayUI();
+  }
+}
+
+function finishQuiz() {
+  quizMode = false;
+  quizPanel.style.display = "none";
+
+  const total = quizLetters.length;
+  scoreboardSummary.textContent =
+    `${quizDifficulty.charAt(0).toUpperCase() + quizDifficulty.slice(1)} difficulty — ${quizScore} / ${total} correct`;
+
+  scoreboardChips.innerHTML = "";
+  for (const r of quizResults) {
+    const chip = document.createElement("div");
+    chip.className = "chip " + (r.correct ? "correct" : "wrong");
+    chip.textContent = r.letter.toUpperCase();
+    scoreboardChips.appendChild(chip);
+  }
+  scoreboard.style.display = "block";
+}
+
+function renderQuizPlayUI() {
+  quizTargetLetterEl.textContent = quizLetters[quizIndex].toUpperCase();
+  quizProgressTextEl.textContent = `Letter ${quizIndex + 1} of ${quizLetters.length}`;
+  quizLiveScoreEl.textContent = `Score: ${quizScore} / ${quizIndex}`;
+  quizTimerBarInner.style.width = "100%";
+}
+
+function updateQuizTimer(nowMs) {
+  if (!quizMode) return;
+  const timeLimit = QUIZ_TIME[quizDifficulty];
+  const elapsed = (nowMs - quizLetterStartMs) / 1000;
+  const remaining = Math.max(0, timeLimit - elapsed);
+  const pct = Math.max(0, (remaining / timeLimit) * 100);
+  quizTimerBarInner.style.width = pct + "%";
+
+  if (remaining <= 0) {
+    advanceQuizLetter(false); // ran out of time -- counts as a miss
+  }
+}
+
+document.getElementById("quizModeBtn").onclick = () => {
+  scoreboard.style.display = "none";
+  quizPanel.style.display = "block";
+  quizSetup.style.display = "block";
+  quizPlay.style.display = "none";
+};
+document.getElementById("easyBtn").onclick = () => startQuiz("easy");
+document.getElementById("mediumBtn").onclick = () => startQuiz("medium");
+document.getElementById("exitQuizBtn").onclick = () => {
+  quizMode = false;
+  quizPanel.style.display = "none";
+};
+
+document.getElementById("spaceBtn").onclick = () => { typedText += " "; updateTypedBar(); };
+document.getElementById("backspaceBtn").onclick = () => { typedText = typedText.slice(0, -1); updateTypedBar(); };
+document.getElementById("clearBtn").onclick = () => { typedText = ""; updateTypedBar(); };
+
+document.addEventListener("keydown", (e) => {
+  if (quizMode) return; // don't let typing controls interfere during a quiz
+  if (e.code === "Space") { typedText += " "; updateTypedBar(); e.preventDefault(); }
+  else if (e.code === "Backspace") { typedText = typedText.slice(0, -1); updateTypedBar(); }
+});
 
 function predictWebcam() {
   ctx.save();
@@ -260,12 +449,17 @@ function predictWebcam() {
   }
 
   if (streakCount >= STABILITY_FRAMES && !locked) {
-    typedText += streakLetter;
     locked = true;
-    updateTypedBar();
+    if (quizMode) {
+      const target = quizLetters[quizIndex];
+      advanceQuizLetter(streakLetter === target);
+    } else {
+      typedText += streakLetter;
+      updateTypedBar();
+    }
   }
 
-  if (currentLetter) {
+  if (currentLetter && !quizMode) {
     const progress = Math.min(streakCount / STABILITY_FRAMES, 1);
     ctx.strokeStyle = "gray";
     ctx.strokeRect(20, 100, 200, 20);
@@ -273,17 +467,13 @@ function predictWebcam() {
     ctx.fillRect(20, 100, 200 * progress, 20);
   }
 
+  if (quizMode) {
+    updateQuizTimer(nowMs);
+    quizLiveScoreEl.textContent = `Score: ${quizScore} / ${quizIndex}`;
+  }
+
   requestAnimationFrame(predictWebcam);
 }
-
-document.getElementById("spaceBtn").onclick = () => { typedText += " "; updateTypedBar(); };
-document.getElementById("backspaceBtn").onclick = () => { typedText = typedText.slice(0, -1); updateTypedBar(); };
-document.getElementById("clearBtn").onclick = () => { typedText = ""; updateTypedBar(); };
-
-document.addEventListener("keydown", (e) => {
-  if (e.code === "Space") { typedText += " "; updateTypedBar(); e.preventDefault(); }
-  else if (e.code === "Backspace") { typedText = typedText.slice(0, -1); updateTypedBar(); }
-});
 
 async function init() {
   await loadModel();
